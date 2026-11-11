@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-# Master claim endpoints own VVIP pool preference and overflow routing.
-
 """Vệ tinh check acc - claim chunk từ tổng bộ, chạy check, trả kết quả.
 
 Vòng lặp: claim (<= 1000 acc/chunk) -> chạy qua engine cũng được dùng bởi
@@ -11,8 +9,8 @@ Nếu xử lý/net lỗi thì release chunk để tổng bộ giao lại cho v�
 Vệ tinh có một HTTP /healthz để Render không ngủ free tier trong lúc chạy dài.
 """
 
-import gc
 import json
+import gc
 import os
 import re
 import secrets
@@ -198,6 +196,7 @@ class _Client:
         return self._request(CLAIM_ENDPOINT, {
             "satellite_id": SATELLITE_ID,
             "lease_minutes": LEASE_MINUTES,
+            "uplv_chunk_protocol": 1,
         })
 
     def heartbeat(self, chunk_ids: list[int]) -> dict:
@@ -426,6 +425,14 @@ def _lease_heartbeat_loop(client: _Client, active_chunk_stops: dict[int, threadi
             print(f"[satellite] heartbeat loi: {exc}", flush=True)
 
 
+def screening_task_id(check, row):
+    try:
+        index = int(row.get('stt', 0)) - 1
+    except (TypeError, ValueError):
+        return None
+    return check['accounts'][index]['task_id'] if 0 <= index < len(check['accounts']) else None
+
+
 def _worker_loop() -> None:
     tcp_module = tcp_ui.load_verified_tcp_module()
     client = _Client(MASTER_URL, MASTER_TOKEN)
@@ -458,6 +465,57 @@ def _worker_loop() -> None:
     )
     heartbeat_thread.start()
 
+    def screen_uplv(check):
+        """Use the CheckPass checker and its capacity, never UpLv rooms."""
+        credentials = [api_test.BatchAccount(i, *item['account']) for i, item in enumerate(check['accounts'], 1)]
+        rows = []
+        def result(row):
+            if check.get('chunk_id'):
+                client._request('/api/checkpass/uplv/chunk-report', {'satellite_id': SATELLITE_ID,
+                    'chunk_id': check['chunk_id'], 'lease_token': check['lease_token'], 'rows': [api_test.public_batch_row(row)], 'done': False})
+                return
+            # Checker may replace the submitted alias with Garena's canonical
+            # username. Its input index is stable; username is not ownership.
+            task = screening_task_id(check, row)
+            if task is None:
+                return
+            value = str(row.get('level', '')).strip()
+            level = int(value) if value.isdigit() and 1 <= int(value) <= 30 else None
+            rows.append({'task_id': task, 'level': level,
+                         'no_character': value.casefold() == 'ctnv' and row.get('player_status') == 'Chưa tạo nhân vật',
+                         'check_status': str(row.get('status', ''))[:80],
+                         'check_result': str(row.get('result_type', ''))[:80],
+                         'check_stage': str(row.get('last_tcp_rejection_stage', ''))[:40],
+                         'check_code': str(row.get('last_tcp_rejection_result', ''))[:20],
+                         'check_error': str(row.get('error', ''))[:200]})
+        try:
+            api_test.run_batch_core(credentials, tcp_module, WORKERS, START_GAP, TIMEOUT,
+                                    stop_event=threading.Event(), on_result=result)
+            if check.get('chunk_id'):
+                client._request('/api/checkpass/uplv/chunk-report', {'satellite_id': SATELLITE_ID,
+                    'chunk_id': check['chunk_id'], 'lease_token': check['lease_token'], 'rows': [], 'done': True})
+                return
+            for attempt in range(3):
+                try:
+                    client._request('/api/checkpass/uplv/report', {'satellite_id': SATELLITE_ID, 'token': check['token'], 'rows': rows})
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2)
+        finally:
+            for credential in credentials:
+                credential.password = ''
+
+    def screening_done(future):
+        nonlocal active_count
+        with active_lock:
+            active_count = max(0, active_count - 1)
+        try:
+            future.result()
+        except Exception as exc:
+            print('[satellite] UpLv screening: ' + type(exc).__name__, flush=True)
+
     with ThreadPoolExecutor(max_workers=CONCURRENT_CHUNKS, thread_name_prefix="chunk") as pool:
         while True:
             try:
@@ -474,6 +532,14 @@ def _worker_loop() -> None:
                 claim = claim_resp.get("claim")
                 if not claim:
                     time.sleep(POLL_INTERVAL)
+                    continue
+
+                if claim.get('kind') == 'uplv_screening':
+                    with active_lock:
+                        active_count += 1
+                    check = {**claim, 'accounts': [{'account': str(raw).split('|')[:2]} for raw in claim['accounts']]}
+                    future = pool.submit(screen_uplv, check)
+                    future.add_done_callback(screening_done)
                     continue
 
                 with active_lock:
